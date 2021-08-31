@@ -3,15 +3,77 @@ import base64
 import json
 import re
 import uuid
-import re
-import json
+import random
 import requests
-from pyDes import PAD_PKCS5, des, CBC
-
+from pyDes import des, CBC, PAD_PKCS5
+from requests_toolbelt import MultipartEncoder
+from datetime import datetime, timezone, timedelta
+from Crypto.Cipher import AES
 from urllib3.exceptions import InsecureRequestWarning
+
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
+
+class Utils:
+    def __init__(self):
+        pass
+
+    # 获取当前北京时间
+    @staticmethod
+    def getAsiaTime():
+        utc_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
+        asia_dt = utc_dt.astimezone(timezone(timedelta(hours=8)))
+        return asia_dt.strftime('%H:%M:%S')
+
+    # 获取当前北京日期
+    @staticmethod
+    def getAsiaDate():
+        utc_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
+        asia_dt = utc_dt.astimezone(timezone(timedelta(hours=8)))
+        return asia_dt.strftime('%Y-%m-%d')
+
+    # 获取指定长度的随机字符
+    @staticmethod
+    def randString(length):
+        baseString = "ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678"
+        data = ''
+        for i in range(length):
+            data += baseString[random.randint(0, len(baseString) - 1)]
+        return data
+
+    @staticmethod
+    def getYmlConfig(yaml_file='./login/system.yml'):
+        file = open(yaml_file, 'r', encoding="utf-8")
+        file_data = file.read()
+        file.close()
+        config = yaml.load(file_data, Loader=yaml.FullLoader)
+        return dict(config)
+
+    # aes加密的实现
+    @staticmethod
+    def encryptAES(password, key):
+        randStrLen = 64
+        randIvLen = 16
+        ranStr = Utils.randString(randStrLen)
+        ivStr = Utils.randString(randIvLen)
+        aes = AES.new(bytes(key, encoding='utf-8'), AES.MODE_CBC, bytes(ivStr, encoding="utf8"))
+        data = ranStr + password
+
+        text_length = len(data)
+        amount_to_pad = AES.block_size - (text_length % AES.block_size)
+        if amount_to_pad == 0:
+            amount_to_pad = AES.block_size
+        pad = chr(amount_to_pad)
+        data = data + pad * amount_to_pad
+
+        text = aes.encrypt(bytes(data, encoding='utf-8'))
+        text = base64.encodebytes(text)
+        text = text.decode('utf-8').strip()
+        return text
+
+
 class iapLogin:
+    # 初始化iap登陆类
     def __init__(self, username, password, login_url, host, session):
         self.username = username
         self.password = password
@@ -36,8 +98,14 @@ class iapLogin:
         params['mobile'] = ''
         params['username'] = self.username
         params['password'] = self.password
-        params['captcha'] = ''
-        data = self.session.post(f'{ self.host }iap/doLogin', params=params, verify=False, allow_redirects=False)
+        needCaptcha = self.getNeedCaptchaUrl()
+        if needCaptcha:
+            imgUrl = f'{self.host}iap/generateCaptcha?ltId={self.ltInfo["result"]["_lt"]}'
+            code = Utils.getCodeFromImg(self.session, imgUrl)
+            params['captcha'] = code
+        else:
+            params['captcha'] = ''
+        data = self.session.post(f'{self.host}iap/doLogin', params=params, verify=False, allow_redirects=False)
         if data.status_code == 302:
             data = self.session.post(data.headers['Location'], verify=False)
             return self.session.cookies
@@ -51,12 +119,15 @@ class iapLogin:
                     raise Exception('验证码错误超过10次，请检查')
             elif data['resultCode'] == 'FAIL_UPNOTMATCH':
                 raise Exception('用户名密码不匹配，请检查')
+            else:
+                raise Exception(f'登陆出错，状态码：{data["resultCode"]}，请联系开发者修复...')
+
 
 class TodayLoginService:
     # 初始化本地登录类
     def __init__(self, userInfo):
-        print("初始化本地登录类")
-        if None == userInfo['username'] or '' == userInfo['username'] or None == userInfo['password'] or '' == userInfo['password'] or None == userInfo['schoolName'] or '' == userInfo['schoolName']:
+        if None == userInfo['username'] or '' == userInfo['username'] or None == userInfo['password'] or '' == userInfo[
+            'password'] or None == userInfo['schoolName'] or '' == userInfo['schoolName']:
             raise Exception('初始化类失败，请键入完整的参数（用户名，密码，学校名称）')
         self.username = userInfo['username']
         self.password = userInfo['password']
@@ -68,124 +139,184 @@ class TodayLoginService:
         self.session.headers = headers
         self.login_url = 'https://ccut.campusphere.net/iap/login?service=https%3A%2F%2Fccut.campusphere.net%2Fportal%2Flogin'
         self.host = 'https://ccut.campusphere.net/'
-        self.login_host ='https://ccut.campusphere.net/'
+        self.login_host = 'https://ccut.campusphere.net/'
         self.loginEntity = None
 
-    # 本地化登陆
     def login(self):
         self.loginEntity = iapLogin(self.username, self.password, self.login_url, self.login_host, self.session)
         self.session.cookies = self.loginEntity.login()
 
-class Collection:
-    # 初始化信息收集类
-    def __init__(self, todaLoginService: TodayLoginService, userInfo):
-        self.session = todaLoginService.session
-        self.host = todaLoginService.host
-        self.userInfo = userInfo
-        self.form = None
-        self.collectWid = None
-        self.formWid = None
-        self.schoolTaskWid = None
 
-    # 查询表单
-    def queryForm(self):
+class AutoSign:
+    # 初始化签到类
+    def __init__(self, todayLoginService: TodayLoginService, userInfo):
+        self.session = todayLoginService.session
+        self.host = todayLoginService.host
+        self.userInfo = userInfo
+        self.taskInfo = None
+        self.task = None
+        self.form = {}
+        self.fileName = None
+
+    # 获取未签到的任务
+    def getUnSignTask(self):
         headers = self.session.headers
         headers['Content-Type'] = 'application/json'
-        queryUrl = f'{self.host}wec-counselor-collector-apps/stu/collector/queryCollectorProcessingList'
-        params = {
-            'pageSize': 6,
-            "pageNumber": 1
+        # 第一次请求接口获取cookies（MOD_AUTH_CAS）
+        url = f'{self.host}wec-counselor-sign-apps/stu/sign/getStuSignInfosInOneDay'
+        self.session.post(url, headers=headers, data=json.dumps({}), verify=False)
+        # 第二次请求接口，真正的拿到具体任务
+        res = self.session.post(url, headers=headers, data=json.dumps({}), verify=False).json()
+        if len(res['datas']['unSignedTasks']) < 1:
+            raise Exception('当前暂时没有未签到的任务哦！')
+        # 获取最后的一个任务
+        latestTask = res['datas']['unSignedTasks'][0]
+        self.taskInfo = {
+            'signInstanceWid': latestTask['signInstanceWid'],
+            'signWid': latestTask['signWid']
         }
-        res = self.session.post(queryUrl, data=json.dumps(params), headers=headers, verify=False).json()
-        if len(res['datas']['rows']) < 1:
-            raise Exception('查询表单失败，请确认你是信息收集并且当前有收集任务。确定请联系开发者')
-        self.collectWid = res['datas']['rows'][0]['wid']
-        self.formWid = res['datas']['rows'][0]['formWid']
-        detailUrl = f'{self.host}wec-counselor-collector-apps/stu/collector/detailCollector'
-        res = self.session.post(detailUrl, headers=headers, data=json.dumps({'collectorWid': self.collectWid}),
-                                verify=False).json()
-        self.schoolTaskWid = res['datas']['collector']['schoolTaskWid']
-        getFormUrl = f'{self.host}wec-counselor-collector-apps/stu/collector/getFormFields'
-        params = {"pageSize": 100, "pageNumber": 1, "formWid": self.formWid, "collectorWid": self.collectWid}
-        res = self.session.post(getFormUrl, headers=headers, data=json.dumps(params), verify=False).json()
-        self.form = res['datas']['rows']
 
-    # 填写表单
+    # 获取具体的签到任务详情
+    def getDetailTask(self):
+        url = f'{self.host}wec-counselor-sign-apps/stu/sign/detailSignInstance'
+        headers = self.session.headers
+        headers['Content-Type'] = 'application/json'
+        res = self.session.post(url, headers=headers, data=json.dumps(self.taskInfo), verify=False).json()
+        self.task = res['datas']
+
+    # 上传图片到阿里云oss
+    def uploadPicture(self):
+        url = f'{self.host}wec-counselor-sign-apps/stu/oss/getUploadPolicy'
+        res = self.session.post(url=url, headers={'content-type': 'application/json'}, data=json.dumps({'fileType': 1}),
+                                verify=False)
+        datas = res.json().get('datas')
+        fileName = datas.get('fileName')
+        policy = datas.get('policy')
+        accessKeyId = datas.get('accessid')
+        signature = datas.get('signature')
+        policyHost = datas.get('host')
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:50.0) Gecko/20100101 Firefox/50.0'
+        }
+        multipart_encoder = MultipartEncoder(
+            fields={  # 这里根据需要进行参数格式设置
+                'key': fileName, 'policy': policy, 'OSSAccessKeyId': accessKeyId, 'success_action_status': '200',
+                'signature': signature,
+                'file': ('blob', open(self.userInfo['photo'], 'rb'), 'image/jpg')
+            })
+        headers['Content-Type'] = multipart_encoder.content_type
+        self.session.post(url=policyHost,
+                          headers=headers,
+                          data=multipart_encoder)
+        self.fileName = fileName
+
+    # 获取图片上传位置
+    def getPictureUrl(self):
+        url = f'{self.host}wec-counselor-sign-apps/stu/sign/previewAttachment'
+        params = {'ossKey': self.fileName}
+        res = self.session.post(url=url, headers={'content-type': 'application/json'}, data=json.dumps(params),
+                                verify=False)
+        photoUrl = res.json().get('datas')
+        return photoUrl
+
+    # 填充表单
     def fillForm(self):
-        index = 0
-        for formItem in self.form[:]:
-            # 只处理必填项
-            if formItem['isRequired'] == 1:
-                userForm = self.userInfo['forms'][index]['form']
-                # 判断用户是否需要检查标题
+        # 判断签到是否需要照片
+        if self.task['isPhoto'] == 1:
+            self.uploadPicture()
+            self.form['signPhotoUrl'] = self.getPictureUrl()
+        else:
+            self.form['signPhotoUrl'] = ''
+        self.form['isNeedExtra'] = self.task['isNeedExtra']
+        if self.task['isNeedExtra'] == 1:
+            extraFields = self.task['extraField']
+            userItems = self.userInfo['forms']
+            extraFieldItemValues = []
+            for i in range(len(extraFields)):
+                if i >= len(userItems):
+                    raise Exception("您的config表单中form字段不够，请检查")
+                userItem = userItems[i]['form']
+                extraField = extraFields[i]
                 if self.userInfo['checkTitle'] == 1:
-                    # 如果检查到标题不相等
-                    if formItem['title'] != userForm['title']:
+                    if userItem['title'].strip() != extraField['title'].strip():
                         raise Exception(
-                            f'\r\n第{index + 1}个配置项的标题不正确\r\n您的标题为：{userForm["title"]}\r\n系统的标题为：{formItem["title"]}')
-                # 文本选项直接赋值
-                if formItem['fieldType'] == 1 or formItem['fieldType'] == 5:
-                    formItem['value'] = userForm['value']
-                # 单选框填充
-                elif formItem['fieldType'] == 2:
-                    formItem['value'] = userForm['value']
-                    # 单选需要移除多余的选项
-                    fieldItems = formItem['fieldItems']
-                    for fieldItem in fieldItems[:]:
-                        if fieldItem['content'] != userForm['value']:
-                            fieldItems.remove(fieldItem)
-                # 多选填充
-                elif formItem['fieldType'] == 3:
-                    fieldItems = formItem['fieldItems']
-                    userItems = userForm['value'].split('|')
-                    for fieldItem in fieldItems[:]:
-                        if fieldItem['content'] in userItems:
-                            formItem['value'] += fieldItem['content'] + ' '
+                            f'\r\n第{i + 1}个配置出错了\r\n您的标题为：{userItem["title"]}\r\n系统的标题为：{extraField["title"]}')
+                extraFieldItems = extraField['extraFieldItems']
+                flag = False
+                data = []
+                # 遍历所有的选项
+                for extraFieldItem in extraFieldItems:
+                    # 如果当前选项为历史选项，将临时保存一下以便config未找到对应值时输出
+                    if extraFieldItem['isSelected']:
+                        data.append(extraFieldItem['content'])
+                    # 初始化局部变量 并初始化数据字典的key
+                    extraFieldItemValue = {}
+                    extraFieldItemValue.setdefault('extraFieldItemValue', None)
+                    extraFieldItemValue.setdefault('extraFieldItemWid', None)
+                    # 如果表单的选项值和配置的值相等
+                    if extraFieldItem['content'] == userItem['value']:
+                        extraFieldItemValue['extraFieldItemWid'] = extraFieldItem['wid']
+                        # 如果是其它字段（other字段）
+                        if extraFieldItem['isOtherItems'] == 1:
+                            if 'other' in userItem:
+                                flag = True
+                                extraFieldItemValue['extraFieldItemValue'] = userItem['other']
+                            else:
+                                raise Exception(
+                                    f'\r\n第{i + 1}个配置项的选项不正确，该字段存在“other”字段，请在配置文件“title，value”下添加一行“other”字段并且填上对应的值'
+                                )
+                        # 如果不是其它字段
                         else:
-                            fieldItems.remove(fieldItem)
-                if formItem['fieldType'] == 4:
-                    pass
-                index += 1
-            else:
-                self.form.remove(formItem)
+                            flag = True
+                            extraFieldItemValue['extraFieldItemValue'] = userItem['value']
+                        extraFieldItemValues.append(extraFieldItemValue)
+                if not flag:
+                    raise Exception(
+                        f'\r\n第{i + 1}个配置出错了\r\n表单未找到你设置的值：{userItem["value"]}\r\n，你上次系统选的值为：{",".join(data)}')
+            self.form['extraFieldItems'] = extraFieldItemValues
+        self.form['signInstanceWid'] = self.task['signInstanceWid']
+        self.form['longitude'] = self.userInfo['lon']
+        self.form['latitude'] = self.userInfo['lat']
+        self.form['isMalposition'] = self.task['isMalposition']
+        # self.form['abnormalReason'] = self.userInfo['abnormalReason']
+        self.form['position'] = self.userInfo['address']
+        self.form['uaIsCpadaily'] = True
+        self.form['signVersion'] = '1.0.0'
 
+    # DES加密
+    def DESEncrypt(self, s, key='b3L26XNL'):
+        key = key
+        iv = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        k = des(key, CBC, iv, pad=None, padmode=PAD_PKCS5)
+        encrypt_str = k.encrypt(s)
+        return base64.b64encode(encrypt_str).decode()
+
+    # 提交签到信息
     def submitForm(self):
         extension = {
+            "lon": self.userInfo['lon'],
             "model": "OPPO R11 Plus",
-            "appVersion": "8.2.14",
-            "systemVersion": "9.1.0",
+            "appVersion": "8.1.14",
+            "systemVersion": "4.4.4",
             "userId": self.userInfo['username'],
             "systemName": "android",
-            "lon": self.userInfo['lon'],
             "lat": self.userInfo['lat'],
             "deviceId": str(uuid.uuid1())
         }
-
         headers = {
             'User-Agent': self.session.headers['User-Agent'],
             'CpdailyStandAlone': '0',
             'extension': '1',
             'Cpdaily-Extension': self.DESEncrypt(json.dumps(extension)),
             'Content-Type': 'application/json; charset=utf-8',
+            'Accept-Encoding': 'gzip',
             'Host': re.findall('//(.*?)/', self.host)[0],
-            'Connection': 'Keep-Alive',
-            'Accept-Encoding': 'gzip'
+            'Connection': 'Keep-Alive'
         }
-        params = {
-            "formWid": self.formWid, "address": self.userInfo['address'], "collectWid": self.collectWid,
-            "schoolTaskWid": self.schoolTaskWid, "form": self.form, "uaIsCpadaily": True
-        }
-        submitUrl = f'{self.host}wec-counselor-collector-apps/stu/collector/submitForm'
-        data = self.session.post(submitUrl, headers=headers, data=json.dumps(params), verify=False).json()
-        return data['message']
+        res = self.session.post(f'{self.host}wec-counselor-sign-apps/stu/sign/submitSign', headers=headers,
+                                data=json.dumps(self.form), verify=False).json()
+        return res['message']
 
-    # DES加密
-    def DESEncrypt(self, content):
-        key = 'b3L26XNL'
-        iv = b"\x01\x02\x03\x04\x05\x06\x07\x08"
-        k = des(key, CBC, iv, pad=None, padmode=PAD_PKCS5)
-        encrypt_str = k.encrypt(content)
-        return base64.b64encode(encrypt_str).decode()
 
 def getYmlConfig(yaml_file='config.yml'):
     file = open(yaml_file, 'r', encoding="utf-8")
@@ -194,26 +325,27 @@ def getYmlConfig(yaml_file='config.yml'):
     config = yaml.load(file_data, Loader=yaml.FullLoader)
     return dict(config)
 
+
 def main():
     config = getYmlConfig()
-    for user in config['users']:
-        if config['debug']:
-            msg = working(user)
-        else:
-            try:
-                msg = working(user)
-            except Exception as e:
-                msg = str(e)
-        print(msg)
+    for index, user in enumerate(config['users']):
+        print(f'{Utils.getAsiaTime()} 第{index + 1}个用户正在执行...')
+        print(working(user))
+
 
 def working(user):
+    print(f'{Utils.getAsiaTime()} 正在获取登录地址')
     today = TodayLoginService(user['user'])
+    print(f'{Utils.getAsiaTime()} 正在登录ing')
     today.login()
-    collection = Collection(today, user['user'])
-    collection.queryForm()
-    collection.fillForm()
-    msg = collection.submitForm()
+    print(f'{Utils.getAsiaTime()} 正在进行“签到”...')
+    sign = AutoSign(today, user['user'])
+    sign.getUnSignTask()
+    sign.getDetailTask()
+    sign.fillForm()
+    msg = sign.submitForm()
     return msg
+
 
 if __name__ == '__main__':
     main()
