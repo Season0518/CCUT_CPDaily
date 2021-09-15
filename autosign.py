@@ -41,14 +41,6 @@ class Utils:
             data += baseString[random.randint(0, len(baseString) - 1)]
         return data
 
-    @staticmethod
-    def getYmlConfig(yaml_file='./login/system.yml'):
-        file = open(yaml_file, 'r', encoding="utf-8")
-        file_data = file.read()
-        file.close()
-        config = yaml.load(file_data, Loader=yaml.FullLoader)
-        return dict(config)
-
     # aes加密的实现
     @staticmethod
     def encryptAES(password, key):
@@ -318,7 +310,7 @@ class AutoSign:
         return res['message']
 
 
-def getYmlConfig(yaml_file='config.yml'):
+def getYmlConfig(yaml_file='config.yml'):  #自己改yml文件路径
     file = open(yaml_file, 'r', encoding="utf-8")
     file_data = file.read()
     file.close()
