@@ -6,7 +6,7 @@
 
 然后在config.yml里面填写你的签到信息
 
-> python3 main.py
+> python3 autosign.py
 
 缺哪个库装哪个库就行,懒,没有技术支持
 
