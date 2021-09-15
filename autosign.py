@@ -322,7 +322,10 @@ def main():
     config = getYmlConfig()
     for index, user in enumerate(config['users']):
         print(f'{Utils.getAsiaTime()} 第{index + 1}个用户正在执行...')
-        print(working(user))
+        try:
+            print(working(user))
+        except:
+            print("第{index + 1}个用户出错...")
 
 
 def working(user):
